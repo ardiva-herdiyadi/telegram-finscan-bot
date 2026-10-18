@@ -271,6 +271,43 @@ def get_monthly_category_breakdown(user_id=None, month_prefix=None):
     _, breakdown, _ = get_monthly_data(month_prefix)
     return breakdown
 
+def get_yearly_data(year_str: str = "2026"):
+    """
+    Mengembalikan (total, breakdown, tx_count) untuk tahun tertentu (misal: '2026').
+    Memprioritaskan data Live langsung dari Google Sheets.
+    """
+    sheets_rows = fetch_google_sheets_data()
+    if sheets_rows is not None:
+        cat_sums = {}
+        total = 0.0
+        tx_count = 0
+        for r in sheets_rows:
+            d = r.get("date", "")
+            if d.startswith(year_str):
+                total += r["amount"]
+                tx_count += 1
+                cat_sums[r["category"]] = cat_sums.get(r["category"], 0.0) + r["amount"]
+
+        breakdown = sorted(cat_sums.items(), key=lambda x: x[1], reverse=True)
+        return total, breakdown, tx_count
+
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("SELECT COALESCE(SUM(amount), 0), COUNT(*) FROM transactions WHERE date LIKE ?", (f"{year_str}%",))
+    row = cursor.fetchone()
+    total = row[0] if row else 0.0
+    tx_count = row[1] if row else 0
+
+    cursor.execute("""
+        SELECT category, SUM(amount) FROM transactions
+        WHERE date LIKE ?
+        GROUP BY category
+        ORDER BY SUM(amount) DESC
+    """, (f"{year_str}%",))
+    breakdown = cursor.fetchall()
+    conn.close()
+    return total, breakdown, tx_count
+
 def delete_last_transaction(user_id):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -439,29 +476,30 @@ def generate_spending_chart(category_rows, month_name):
 # Telegram Bot Command Handlers
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    name = user.first_name if user else "Bestie"
+    name = user.first_name if user else "Ardiva"
 
     welcome_text = (
-        f"✨ *Halo {name}! Welcome to FinScan AI!* 💸\n\n"
-        "Asisten pencatat keuangan pribadi pintarmu yang terhubung langsung ke **Google Sheets**.\n\n"
-        "⚡ *Cara Pakai Sangat Gampang:*\n"
-        "1. 📸 *Kirim Foto Struk Belanjaan* (Alfamart, kafe, SPBU, resto) $\\rightarrow$ AI otomatis membaca item & totalnya!\n"
-        "2. 💬 *Ketik Teks Santai* $\\rightarrow$ contoh:\n"
-        "   • `Makan siang bakso 25rb`\n"
-        "   • `Beli bensin pertalite 50k`\n"
-        "   • `Kopi kenangan 22.000 lewat qris`\n\n"
-        "📊 *Menu Perintah Cepat:*\n"
-        "• `/rekap` - Lihat ringkasan bulanan & grafik visual\n"
-        "• `/sheets` - Buka file Google Sheets kamu secara live\n"
-        "• `/batal` - Hapus transaksi terakhir jika salah catat\n\n"
-        "💡 _FinScan AI diciptakan oleh Ardiva Herdiyadi_\n\n"
-        "Yuk coba sekarang! Ketik pengeluaran terakhirmu atau kirim foto struk di bawah ini:"
+        f"Halo {name}! Selamat datang di FinScan.\n\n"
+        "Asisten pencatat keuangan pribadi yang terhubung langsung ke Google Sheets Anda.\n\n"
+        "Cara Penggunaan:\n"
+        "1. Kirim Foto Struk Belanjaan (minimarket, kafe, SPBU, resto) → sistem otomatis mencatat rincian dan nominalnya.\n"
+        "2. Ketik Pengeluaran secara santai → contoh:\n"
+        "   • Makan siang bakso 25rb\n"
+        "   • Beli bensin pertalite 50k\n"
+        "   • Kopi kenangan 22.000 lewat qris\n\n"
+        "Menu Perintah:\n"
+        "• /rekap - Rekap pengeluaran bulanan dan grafik visual\n"
+        "• /tahunan - Rekap total tahunan 2026\n"
+        "• /sheets - Buka file Google Sheets langsung\n"
+        "• /batal - Hapus transaksi terakhir jika salah catat\n\n"
+        "FinScan • Diciptakan oleh Ardiva Herdiyadi\n\n"
+        "Silakan ketik pengeluaran Anda atau kirimkan foto struk di bawah ini:"
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("📊 Rekap Bulan Ini", callback_data="btn_rekap"),
-            InlineKeyboardButton("🔗 Buka Google Sheets", url=SHEETS_VIEW_URL)
+            InlineKeyboardButton("Rekap Bulan Ini", callback_data="btn_rekap"),
+            InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)
         ]
     ]
 
@@ -476,34 +514,41 @@ async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
     current_month = datetime.now().strftime("%Y-%m")
     month_prefix = target_month if target_month else current_month
     month_display = format_month_label(month_prefix)
+    current_year = month_prefix[:4]
 
     total, breakdown, available_months = get_monthly_data(month_prefix)
 
-    # Tombol navigasi bulan interaktif
+    # Tombol navigasi bulan bersih tanpa icon berlebihan
     keyboard = []
     month_nav_row = []
     for m in ["2026-08", "2026-09", "2026-10"]:
         if m in available_months or m == month_prefix:
             label = format_month_label(m).split()[0]
             if m == month_prefix:
-                month_nav_row.append(InlineKeyboardButton(f"📍 {label}", callback_data=f"rekap_m_{m}"))
+                month_nav_row.append(InlineKeyboardButton(f"• {label} •", callback_data=f"rekap_m_{m}"))
             else:
-                month_nav_row.append(InlineKeyboardButton(f"📅 {label}", callback_data=f"rekap_m_{m}"))
+                month_nav_row.append(InlineKeyboardButton(label, callback_data=f"rekap_m_{m}"))
 
     if month_nav_row:
         keyboard.append(month_nav_row)
 
+    # Tombol Rekap Tahunan
     keyboard.append([
-        InlineKeyboardButton("🔄 Sinkron Ulang Sheets", callback_data=f"rekap_refresh_{month_prefix}"),
-        InlineKeyboardButton("🔗 Buka Sheets Live", url=SHEETS_VIEW_URL)
+        InlineKeyboardButton(f"Rekap Tahunan {current_year}", callback_data=f"rekap_year_{current_year}")
+    ])
+
+    # Tombol Aksi
+    keyboard.append([
+        InlineKeyboardButton("Perbarui Data", callback_data=f"rekap_refresh_{month_prefix}"),
+        InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)
     ])
 
     if total == 0:
         msg = (
-            f"📊 *REKAP PENGELUARAN — {month_display.upper()}*\n"
+            f"*REKAP PENGELUARAN — {month_display.upper()}*\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
             f"Belum ada catatan pengeluaran di Google Sheets untuk bulan {month_display}.\n\n"
-            f"💡 _FinScan AI by Ardiva Herdiyadi_"
+            f"_FinScan AI by Ardiva Herdiyadi_"
         )
         if update.callback_query:
             await update.callback_query.answer()
@@ -520,18 +565,18 @@ async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
         return
 
     text_lines = [
-        f"📊 *REKAP PENGELUARAN — {month_display.upper()}*",
+        f"*REKAP PENGELUARAN — {month_display.upper()}*",
         "━━━━━━━━━━━━━━━━━━━━━",
-        f"💰 *Total Terpakai:* `{format_rupiah(total)}`",
+        f"*Total Terpakai:* `{format_rupiah(total)}`",
         "",
-        "📂 *Rincian Per Kategori:*"
+        "*Rincian Per Kategori:*"
     ]
 
     for cat, amt in breakdown:
         pct = (amt / total) * 100
         text_lines.append(f"• *{cat}:* {format_rupiah(amt)} `({pct:.1f}%)`")
 
-    text_lines.append("\n💡 _FinScan AI • Created by Ardiva Herdiyadi_")
+    text_lines.append("\n_FinScan AI • Created by Ardiva Herdiyadi_")
     summary_text = "\n".join(text_lines)
 
     # Generate Chart
@@ -559,12 +604,85 @@ async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
             parse_mode=constants.ParseMode.MARKDOWN
         )
 
+async def rekap_tahunan_command(update: Update, context: ContextTypes.DEFAULT_TYPE, target_year: str = "2026"):
+    total, breakdown, tx_count = get_yearly_data(target_year)
+
+    keyboard = [
+        [
+            InlineKeyboardButton("Rekap Bulan Ini", callback_data="btn_rekap")
+        ],
+        [
+            InlineKeyboardButton("Perbarui Data", callback_data=f"rekap_refresh_year_{target_year}"),
+            InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)
+        ]
+    ]
+
+    if total == 0:
+        msg = (
+            f"*REKAP PENGELUARAN TAHUNAN — {target_year}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Belum ada catatan pengeluaran di Google Sheets untuk tahun {target_year}.\n\n"
+            f"_FinScan AI by Ardiva Herdiyadi_"
+        )
+        if update.callback_query:
+            await update.callback_query.answer()
+            chat_id = update.callback_query.message.chat_id
+        else:
+            chat_id = update.message.chat_id
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
+        return
+
+    text_lines = [
+        f"*REKAP PENGELUARAN TAHUNAN — {target_year}*",
+        "━━━━━━━━━━━━━━━━━━━━━",
+        f"*Total Terpakai:* `{format_rupiah(total)}` _({tx_count} Transaksi)_",
+        "",
+        "*Rincian Per Kategori:*"
+    ]
+
+    for cat, amt in breakdown:
+        pct = (amt / total) * 100
+        text_lines.append(f"• *{cat}:* {format_rupiah(amt)} `({pct:.1f}%)`")
+
+    text_lines.append("\n_FinScan AI • Created by Ardiva Herdiyadi_")
+    summary_text = "\n".join(text_lines)
+
+    chart_bytes = generate_spending_chart(breakdown, f"Tahun {target_year}")
+
+    if update.callback_query:
+        await update.callback_query.answer()
+        chat_id = update.callback_query.message.chat_id
+    else:
+        chat_id = update.message.chat_id
+
+    if chart_bytes:
+        await context.bot.send_photo(
+            chat_id=chat_id,
+            photo=chart_bytes,
+            caption=summary_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=summary_text,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
+
 async def sheets_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
-        [InlineKeyboardButton("📂 Klik untuk Membuka Google Sheets", url=SHEETS_VIEW_URL)]
+        [InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)]
     ]
     await update.message.reply_text(
-        "📊 *File Google Sheets Kamu:*\nKlik tombol di bawah ini untuk melihat dan mengedit tabel secara langsung di browser atau ponselmu:",
+        "*File Google Sheets:*\nKlik tombol di bawah ini untuk melihat dan mengedit tabel secara langsung:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode=constants.ParseMode.MARKDOWN
     )
@@ -627,8 +745,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Simpan ke Sheets", callback_data="tx_confirm"),
-            InlineKeyboardButton("❌ Batalkan", callback_data="tx_cancel")
+            InlineKeyboardButton("Simpan", callback_data="tx_confirm"),
+            InlineKeyboardButton("Batalkan", callback_data="tx_cancel")
         ]
     ]
 
@@ -640,7 +758,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat_id = update.message.chat_id
-    status_msg = await update.message.reply_text("🔍 *AI sedang menganalisis foto struk...*", parse_mode=constants.ParseMode.MARKDOWN)
+    status_msg = await update.message.reply_text("Menganalisis foto struk...", parse_mode=constants.ParseMode.MARKDOWN)
     await context.bot.send_chat_action(chat_id=chat_id, action=constants.ChatAction.TYPING)
 
     # Download largest photo resolution
@@ -652,7 +770,7 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if not parsed or not parsed.get("is_expense") or parsed.get("amount", 0) <= 0:
         await update.message.reply_text(
-            "⚠️ Maaf, AI kesulitan membaca rincian dari struk ini. Pastikan foto cukup terang, fokus, dan total harga terlihat jelas ya!",
+            "Maaf, sistem kesulitan membaca rincian dari struk ini. Pastikan foto cukup terang, fokus, dan total harga terlihat jelas.",
             parse_mode=constants.ParseMode.MARKDOWN
         )
         return
@@ -662,20 +780,20 @@ async def handle_photo_message(update: Update, context: ContextTypes.DEFAULT_TYP
 
     amount_str = format_rupiah(parsed.get("amount", 0))
     confirm_text = (
-        f"🧾 *Hasil Scan Struk Belanja:* ✨\n"
+        f"*Hasil Pembacaan Struk Belanja:*\n"
         f"━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🏪 *Toko:* {parsed.get('merchant', '-')}\n"
-        f"📁 *Kategori:* {parsed.get('category', 'Lainnya')}\n"
-        f"🛒 *Rincian Barang:*\n_{parsed.get('description', '-')}_\n\n"
-        f"📅 *Tanggal:* {parsed.get('date')} ({parsed.get('time')})\n"
-        f"💰 *Total Bayar:* *{amount_str}*\n\n"
+        f"*Tempat:* {parsed.get('merchant', '-')}\n"
+        f"*Kategori:* {parsed.get('category', 'Lainnya')}\n"
+        f"*Rincian:*\n_{parsed.get('description', '-')}_\n\n"
+        f"*Tanggal:* {parsed.get('date')} ({parsed.get('time')})\n"
+        f"*Total Bayar:* *{amount_str}*\n\n"
         f"Apakah data di atas sudah sesuai?"
     )
 
     keyboard = [
         [
-            InlineKeyboardButton("✅ Simpan ke Sheets", callback_data="tx_confirm"),
-            InlineKeyboardButton("❌ Batalkan", callback_data="tx_cancel")
+            InlineKeyboardButton("Simpan", callback_data="tx_confirm"),
+            InlineKeyboardButton("Batalkan", callback_data="tx_cancel")
         ]
     ]
 
@@ -705,10 +823,20 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await rekap_command(update, context, target_month=target_m)
         return
 
+    if data.startswith("rekap_year_"):
+        target_y = data.replace("rekap_year_", "")
+        await rekap_tahunan_command(update, context, target_year=target_y)
+        return
+
+    if data.startswith("rekap_refresh_year_"):
+        target_y = data.replace("rekap_refresh_year_", "")
+        await rekap_tahunan_command(update, context, target_year=target_y)
+        return
+
     if data == "tx_cancel":
         await query.answer()
         context.user_data.pop("pending_tx", None)
-        await query.edit_message_text("❌ *Transaksi dibatalkan.*", parse_mode=constants.ParseMode.MARKDOWN)
+        await query.edit_message_text("Transaksi dibatalkan.", parse_mode=constants.ParseMode.MARKDOWN)
         return
 
     if data == "tx_confirm":
@@ -717,7 +845,7 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         source = context.user_data.get("pending_source", "Chat")
 
         if not tx:
-            await query.edit_message_text("⚠️ Data transaksi sudah kedaluwarsa. Silakan ulangi input.", parse_mode=constants.ParseMode.MARKDOWN)
+            await query.edit_message_text("Data transaksi sudah kedaluwarsa. Silakan ulangi input.", parse_mode=constants.ParseMode.MARKDOWN)
             return
 
         # 1. Save to SQLite
@@ -748,23 +876,23 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_month = datetime.now().strftime("%Y-%m")
         total_month = get_monthly_total(user_id, current_month)
 
-        sync_status_text = "✅ *Tersimpan & Terhubung ke Google Sheets!*" if synced else "✅ *Tersimpan di Database Lokal!* _(Sinkronisasi Sheets opsional)_"
+        sync_status_text = "*Tersimpan dan Terhubung ke Google Sheets.*" if synced else "*Tersimpan di Database Lokal.*"
 
         success_text = (
             f"{sync_status_text}\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏪 *Tempat:* {tx.get('merchant')}\n"
-            f"📁 *Kategori:* {tx.get('category')}\n"
-            f"💰 *Nominal:* *{format_rupiah(tx.get('amount'))}*\n\n"
-            f"📊 *Total Pengeluaran Bulan Ini:* `{format_rupiah(total_month)}`\n"
+            f"*Tempat:* {tx.get('merchant')}\n"
+            f"*Kategori:* {tx.get('category')}\n"
+            f"*Nominal:* *{format_rupiah(tx.get('amount'))}*\n\n"
+            f"*Total Pengeluaran Bulan Ini:* `{format_rupiah(total_month)}`\n"
             f"━━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 _FinScan AI by Ardiva Herdiyadi_"
+            f"_FinScan • Ardiva Herdiyadi_"
         )
 
         keyboard = [
             [
-                InlineKeyboardButton("📊 Lihat Rekap", callback_data="btn_rekap"),
-                InlineKeyboardButton("📂 Buka Sheets", url=SHEETS_VIEW_URL)
+                InlineKeyboardButton("Lihat Rekap", callback_data="btn_rekap"),
+                InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)
             ]
         ]
 
@@ -779,10 +907,11 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def post_init(application):
     """Register commands in Telegram's Menu button."""
     await application.bot.set_my_commands([
-        BotCommand("start", "⚡ Mulai & Petunjuk FinScan"),
-        BotCommand("rekap", "📊 Rekap Pengeluaran & Grafik"),
-        BotCommand("sheets", "📂 Buka Google Sheets Live"),
-        BotCommand("batal", "🗑️ Batalkan Transaksi Terakhir")
+        BotCommand("start", "Mulai & Panduan FinScan"),
+        BotCommand("rekap", "Rekap Bulanan & Grafik"),
+        BotCommand("tahunan", "Rekap Tahunan 2026"),
+        BotCommand("sheets", "Buka Google Sheets Live"),
+        BotCommand("batal", "Batalkan Transaksi Terakhir")
     ])
 
 
@@ -803,6 +932,7 @@ def main():
     # Handlers
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("rekap", rekap_command))
+    application.add_handler(CommandHandler("tahunan", rekap_tahunan_command))
     application.add_handler(CommandHandler("sheets", sheets_command))
     application.add_handler(CommandHandler("batal", batal_command))
     application.add_handler(CallbackQueryHandler(callback_router))
