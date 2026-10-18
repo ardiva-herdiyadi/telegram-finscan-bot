@@ -1,6 +1,8 @@
 import os
 import sys
 import io
+import re
+import csv
 import json
 import sqlite3
 import logging
@@ -127,29 +129,147 @@ def save_transaction_to_db(user_id, date, time, category, merchant, description,
     conn.close()
     return tx_id
 
-def get_monthly_total(user_id, month_prefix):
+MONTH_NAMES_ID = {
+    "01": "Januari",
+    "02": "Februari",
+    "03": "Maret",
+    "04": "April",
+    "05": "Mei",
+    "06": "Juni",
+    "07": "Juli",
+    "08": "Agustus",
+    "09": "September",
+    "10": "Oktober",
+    "11": "November",
+    "12": "Desember"
+}
+
+def format_month_label(month_prefix: str) -> str:
+    """Mengubah format YYYY-MM menjadi 'Bulan Tahun' dalam Bahasa Indonesia."""
+    try:
+        y, m = month_prefix.split("-")
+        return f"{MONTH_NAMES_ID.get(m, m)} {y}"
+    except Exception:
+        return month_prefix
+
+def get_spreadsheet_id(url: str) -> str:
+    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9-_]+)", url)
+    return match.group(1) if match else "1aulSNCWojSKzlp1L3LCmnMPzdsw1OXrUtTtI5Sz30_o"
+
+def fetch_google_sheets_data():
+    """
+    Mengambil data riil secara live dari Google Sheets (CSV Export endpoint).
+    Menjamin 100% sinkronisasi antara Telegram dan spreadsheet pengguna.
+    """
+    ss_id = get_spreadsheet_id(SHEETS_VIEW_URL)
+    csv_url = f"https://docs.google.com/spreadsheets/d/{ss_id}/gviz/tq?tqx=out:csv"
+    try:
+        res = requests.get(csv_url, timeout=8)
+        if res.status_code == 200:
+            reader = csv.reader(io.StringIO(res.text))
+            header = next(reader, None)
+            rows = []
+            for r in reader:
+                if len(r) >= 6:
+                    tgl = r[0].strip()
+                    wkt = r[1].strip()
+                    kat = r[2].strip()
+                    mer = r[3].strip()
+                    dsc = r[4].strip()
+                    amt_raw = r[5].replace("Rp", "").replace(".", "").replace(",", "").strip()
+                    try:
+                        amt = float(amt_raw)
+                    except ValueError:
+                        continue
+                    rows.append({
+                        "date": tgl,
+                        "time": wkt,
+                        "category": kat,
+                        "merchant": mer,
+                        "description": dsc,
+                        "amount": amt,
+                        "source": r[6].strip() if len(r) > 6 else "Google Sheets"
+                    })
+            if rows:
+                return rows
+    except Exception as e:
+        logger.error(f"Error fetching Google Sheets live CSV: {e}")
+    return None
+
+def get_monthly_data(month_prefix: str):
+    """
+    Mengembalikan (total, breakdown, available_months) untuk prefix bulan (YYYY-MM).
+    Memprioritaskan data Live dari Google Sheets dan otomatis meng-cache ke SQLite.
+    """
+    sheets_rows = fetch_google_sheets_data()
+    if sheets_rows is not None:
+        # Cache ke SQLite lokal untuk redundansi
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("DELETE FROM transactions")
+            for r in sheets_rows:
+                c.execute("""
+                    INSERT INTO transactions (user_id, date, time, category, merchant, description, amount, source)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (0, r["date"], r["time"], r["category"], r["merchant"], r["description"], r["amount"], r["source"]))
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            logger.warning(f"Cache to SQLite warning: {e}")
+
+        # Hitung langsung dari baris Google Sheets
+        cat_sums = {}
+        total = 0.0
+        all_months = set()
+        for r in sheets_rows:
+            d = r.get("date", "")
+            if len(d) >= 7:
+                all_months.add(d[:7])
+            if d.startswith(month_prefix):
+                total += r["amount"]
+                cat_sums[r["category"]] = cat_sums.get(r["category"], 0.0) + r["amount"]
+
+        breakdown = sorted(cat_sums.items(), key=lambda x: x[1], reverse=True)
+        available_months = sorted(list(all_months), reverse=True)
+        return total, breakdown, available_months
+
+    # Fallback ke SQLite jika koneksi Google Sheets bermasalah
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute("""
         SELECT COALESCE(SUM(amount), 0) FROM transactions
-        WHERE user_id = ? AND date LIKE ?
-    """, (user_id, f"{month_prefix}%"))
+        WHERE date LIKE ?
+    """, (f"{month_prefix}%",))
     total = cursor.fetchone()[0]
-    conn.close()
-    return total
 
-def get_monthly_category_breakdown(user_id, month_prefix):
-    conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
     cursor.execute("""
         SELECT category, SUM(amount) FROM transactions
-        WHERE user_id = ? AND date LIKE ?
+        WHERE date LIKE ?
         GROUP BY category
         ORDER BY SUM(amount) DESC
-    """, (user_id, f"{month_prefix}%"))
-    rows = cursor.fetchall()
+    """, (f"{month_prefix}%",))
+    breakdown = cursor.fetchall()
+
+    cursor.execute("""
+        SELECT DISTINCT substr(date, 1, 7) FROM transactions
+        ORDER BY substr(date, 1, 7) DESC
+    """)
+    available_months = [row[0] for row in cursor.fetchall() if row[0]]
     conn.close()
-    return rows
+    return total, breakdown, available_months
+
+def get_monthly_total(user_id=None, month_prefix=None):
+    if not month_prefix:
+        month_prefix = datetime.now().strftime("%Y-%m")
+    total, _, _ = get_monthly_data(month_prefix)
+    return total
+
+def get_monthly_category_breakdown(user_id=None, month_prefix=None):
+    if not month_prefix:
+        month_prefix = datetime.now().strftime("%Y-%m")
+    _, breakdown, _ = get_monthly_data(month_prefix)
+    return breakdown
 
 def delete_last_transaction(user_id):
     conn = sqlite3.connect(DB_PATH)
@@ -351,25 +471,56 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=constants.ParseMode.MARKDOWN
     )
 
-async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, target_month: str = None):
+    user_id = update.effective_user.id if update.effective_user else 0
     current_month = datetime.now().strftime("%Y-%m")
-    month_name = datetime.now().strftime("%B %Y")
+    month_prefix = target_month if target_month else current_month
+    month_display = format_month_label(month_prefix)
 
-    total = get_monthly_total(user_id, current_month)
-    breakdown = get_monthly_category_breakdown(user_id, current_month)
+    total, breakdown, available_months = get_monthly_data(month_prefix)
+
+    # Tombol navigasi bulan interaktif
+    keyboard = []
+    month_nav_row = []
+    for m in ["2026-08", "2026-09", "2026-10"]:
+        if m in available_months or m == month_prefix:
+            label = format_month_label(m).split()[0]
+            if m == month_prefix:
+                month_nav_row.append(InlineKeyboardButton(f"📍 {label}", callback_data=f"rekap_m_{m}"))
+            else:
+                month_nav_row.append(InlineKeyboardButton(f"📅 {label}", callback_data=f"rekap_m_{m}"))
+
+    if month_nav_row:
+        keyboard.append(month_nav_row)
+
+    keyboard.append([
+        InlineKeyboardButton("🔄 Sinkron Ulang Sheets", callback_data=f"rekap_refresh_{month_prefix}"),
+        InlineKeyboardButton("🔗 Buka Sheets Live", url=SHEETS_VIEW_URL)
+    ])
 
     if total == 0:
-        msg = f"📊 *Belum ada catatan pengeluaran di bulan {month_name}.*\nYuk mulai catat dengan ketik pengeluaranmu atau kirim foto struk!"
+        msg = (
+            f"📊 *REKAP PENGELUARAN — {month_display.upper()}*\n"
+            f"━━━━━━━━━━━━━━━━━━━━━\n"
+            f"Belum ada catatan pengeluaran di Google Sheets untuk bulan {month_display}.\n\n"
+            f"💡 _FinScan AI by Ardiva Herdiyadi_"
+        )
         if update.callback_query:
             await update.callback_query.answer()
-            await update.callback_query.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN)
+            chat_id = update.callback_query.message.chat_id
         else:
-            await update.message.reply_text(msg, parse_mode=constants.ParseMode.MARKDOWN)
+            chat_id = update.message.chat_id
+
+        await context.bot.send_message(
+            chat_id=chat_id,
+            text=msg,
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode=constants.ParseMode.MARKDOWN
+        )
         return
 
     text_lines = [
-        f"📊 *REKAP PENGELUARAN — {month_name.upper()}*",
+        f"📊 *REKAP PENGELUARAN — {month_display.upper()}*",
         "━━━━━━━━━━━━━━━━━━━━━",
         f"💰 *Total Terpakai:* `{format_rupiah(total)}`",
         "",
@@ -383,14 +534,8 @@ async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text_lines.append("\n💡 _FinScan AI • Created by Ardiva Herdiyadi_")
     summary_text = "\n".join(text_lines)
 
-    keyboard = [
-        [
-            InlineKeyboardButton("🔗 Buka Google Sheets Live", url=SHEETS_VIEW_URL)
-        ]
-    ]
-
     # Generate Chart
-    chart_bytes = generate_spending_chart(breakdown, month_name)
+    chart_bytes = generate_spending_chart(breakdown, month_display)
 
     if update.callback_query:
         await update.callback_query.answer()
@@ -548,6 +693,16 @@ async def callback_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if data == "btn_rekap":
         await rekap_command(update, context)
+        return
+
+    if data.startswith("rekap_m_"):
+        target_m = data.replace("rekap_m_", "")
+        await rekap_command(update, context, target_month=target_m)
+        return
+
+    if data.startswith("rekap_refresh_"):
+        target_m = data.replace("rekap_refresh_", "")
+        await rekap_command(update, context, target_month=target_m)
         return
 
     if data == "tx_cancel":
