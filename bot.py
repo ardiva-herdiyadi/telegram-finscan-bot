@@ -524,10 +524,7 @@ async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
     for m in ["2026-08", "2026-09", "2026-10"]:
         if m in available_months or m == month_prefix:
             label = format_month_label(m).split()[0]
-            if m == month_prefix:
-                month_nav_row.append(InlineKeyboardButton(f"• {label} •", callback_data=f"rekap_m_{m}"))
-            else:
-                month_nav_row.append(InlineKeyboardButton(label, callback_data=f"rekap_m_{m}"))
+            month_nav_row.append(InlineKeyboardButton(label, callback_data=f"rekap_m_{m}"))
 
     if month_nav_row:
         keyboard.append(month_nav_row)
@@ -535,12 +532,6 @@ async def rekap_command(update: Update, context: ContextTypes.DEFAULT_TYPE, targ
     # Tombol Rekap Tahunan
     keyboard.append([
         InlineKeyboardButton(f"Rekap Tahunan {current_year}", callback_data=f"rekap_year_{current_year}")
-    ])
-
-    # Tombol Aksi
-    keyboard.append([
-        InlineKeyboardButton("Perbarui Data", callback_data=f"rekap_refresh_{month_prefix}"),
-        InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)
     ])
 
     if total == 0:
@@ -610,10 +601,6 @@ async def rekap_tahunan_command(update: Update, context: ContextTypes.DEFAULT_TY
     keyboard = [
         [
             InlineKeyboardButton("Rekap Bulan Ini", callback_data="btn_rekap")
-        ],
-        [
-            InlineKeyboardButton("Perbarui Data", callback_data=f"rekap_refresh_year_{target_year}"),
-            InlineKeyboardButton("Buka Google Sheets", url=SHEETS_VIEW_URL)
         ]
     ]
 
